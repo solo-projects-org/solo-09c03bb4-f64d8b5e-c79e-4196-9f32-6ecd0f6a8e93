@@ -1,7 +1,12 @@
-"""生成两套本地样例 Delta 表，供网页一键加载。
+"""生成两套本地样例 Delta 表，供网页一键加载或手动上传。
 
 样例只构造 _delta_log 中的 JSON 提交、经典单文件 Parquet 检查点
 和现存数据文件路径清单，不依赖真实 Spark / Delta Lake 运行时。
+
+- healthy_table：单批留存的健康表；
+- incident_table：对象存储故障后的两批日志备份（batch_a / batch_b），
+  内含字节一致的重叠文件（应去重）与内容不一致的同名文件（应判冲突、
+  整组弃用），可在网页上分两批一并上传。
 
 运行：python -I scripts/generate_samples.py
 """
@@ -9,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pyarrow as pa
@@ -140,35 +146,63 @@ def build_healthy() -> None:
 
 
 def build_incident() -> None:
-    """误删事故表：v3 提交丢失、a4/a6 数据文件被删，但 v2/v4 检查点留存。"""
+    """误删事故表：对象存储故障后抢救出的两批日志备份。
+
+    真实历史 v0–v6：v0 建表（a0,a1）→ v1 加 a2 → v2 加 a3 删 a1（写检查点）
+    → v3 加 a4 → v4 加 a5（写检查点）→ v5 加 a6 删 a2 → v6 加 a7。
+
+    - 批次 A（主存储事故前的备份，覆盖 v0–v4）；
+    - 批次 B（副本存储的备份，覆盖 v2–v5），与 A 有重叠：
+      v2 / v4 提交与 v4 检查点字节一致（应去重）；
+      v3 提交与 v2 检查点内容不一致（应判冲突、整组弃用）；
+    - v6 提交两批都没有（未上传）；
+    - 现存清单缺 a4（事故中被删），a1 逻辑删除但物理仍在。
+    """
     table_dir = SAMPLES / "incident_table"
     reset_dir(table_dir)
-    log_dir = table_dir / "_delta_log"
-    log_dir.mkdir(parents=True)
+    log_a = table_dir / "batch_a" / "_delta_log"
+    log_b = table_dir / "batch_b" / "_delta_log"
+    log_a.mkdir(parents=True)
+    log_b.mkdir(parents=True)
 
     a = lambda n: f"data/part-{n:05d}-incident.parquet"
-    write_commit(log_dir, 0, [PROTOCOL_ACTION, add_action(a(0)), add_action(a(1))])
-    write_commit(log_dir, 1, [add_action(a(2))])
-    write_commit(log_dir, 2, [add_action(a(3)), remove_action(a(1))])
-    write_checkpoint(log_dir, 2, [a(0), a(2), a(3)], [a(1)])
 
-    # 事故中 v3 提交（add a4）被误删，且没有留下备份
-    v3_lost = log_dir / commit_name(3)
-    assert not v3_lost.exists()
-
-    write_commit(log_dir, 4, [add_action(a(5))])
-    # v4 检查点在 v3 提交丢失前生成，保留了 v3 引入的 a4
-    write_checkpoint(log_dir, 4, [a(0), a(2), a(3), a(4), a(5)], [a(1)])
-    write_commit(log_dir, 5, [add_action(a(6)), remove_action(a(2))])
-
-    # 一个分片检查点残片：本工具明确不支持，应在页面中列为“已忽略”
-    (log_dir / f"{1:020d}.checkpoint.00000000000000000001.00000000000000000002.parquet")\
-        .write_bytes(b"not-a-real-multi-part-checkpoint")
-    (log_dir / "_last_checkpoint").write_text(json.dumps({
+    # ---- 批次 A：主存储事故前的备份（v0–v4）----
+    write_commit(log_a, 0, [PROTOCOL_ACTION, add_action(a(0)), add_action(a(1))])
+    write_commit(log_a, 1, [add_action(a(2))])
+    write_commit(log_a, 2, [add_action(a(3)), remove_action(a(1))])
+    # v2 检查点：当前活动文件 a0,a2,a3；a1 是墓碑
+    write_checkpoint(log_a, 2, [a(0), a(2), a(3)], [a(1)])
+    write_commit(log_a, 3, [add_action(a(4))])
+    write_commit(log_a, 4, [add_action(a(5))])
+    # v4 检查点在 v3 之后生成，保留了 v3 引入的 a4
+    write_checkpoint(log_a, 4, [a(0), a(2), a(3), a(4), a(5)], [a(1)])
+    (log_a / "_last_checkpoint").write_text(json.dumps({
         "version": 4, "size": 0}), encoding="utf-8")
 
-    # 现存清单：a4、a6 已随误删消失；a1 虽已逻辑删除但物理文件仍在
-    write_manifest(table_dir, [a(0), a(1), a(2), a(3), a(5)])
+    # ---- 批次 B：副本存储的备份（v2–v5），部分重叠文件与 A 不一致 ----
+    # 与 A 字节一致的重叠文件 → 应自动去重
+    shutil.copyfile(log_a / commit_name(2), log_b / commit_name(2))
+    shutil.copyfile(log_a / commit_name(4), log_b / commit_name(4))
+    shutil.copyfile(log_a / checkpoint_name(4), log_b / checkpoint_name(4))
+    # 与 A 内容不一致的同名文件 → 应判冲突、整组弃用：
+    # v3 提交在副本侧是一次未完成的重写（同路径、不同元数据）
+    write_commit(log_b, 3, [{"add": {
+        "path": a(4), "partitionValues": {}, "size": 4096,
+        "modificationTime": 1700000099999, "dataChange": True}}])
+    # v2 检查点在副本侧是残缺版本（漏了 v2 才加入的 a3）
+    write_checkpoint(log_b, 2, [a(0), a(2)], [a(1)])
+    # 仅批次 B 有的新提交
+    write_commit(log_b, 5, [add_action(a(6)), remove_action(a(2))])
+    # 一个分片检查点残片：本工具明确不支持，应在页面中列为“已忽略”
+    (log_b / f"{1:020d}.checkpoint.00000000000000000001.00000000000000000002.parquet")\
+        .write_bytes(b"not-a-real-multi-part-checkpoint")
+    (log_b / "_last_checkpoint").write_text(json.dumps({
+        "version": 4, "size": 0}), encoding="utf-8")
+
+    # v6 提交（add a7）两批备份都没有 → 逐版报告列为“未上传”
+    # 现存清单：a4 已随误删消失；a1 虽已逻辑删除但物理文件仍在
+    write_manifest(table_dir, [a(0), a(1), a(2), a(3), a(5), a(6)])
 
 
 def main() -> None:
@@ -176,11 +210,13 @@ def main() -> None:
     build_incident()
     print(f"样例已生成于 {SAMPLES}")
     for table in sorted(SAMPLES.iterdir()):
-        if table.is_dir():
-            logs = sorted(p.name for p in (table / "_delta_log").iterdir())
-            print(f"\n[{table.name}] _delta_log:")
-            for name in logs:
-                print(f"  - {name}")
+        if not table.is_dir():
+            continue
+        print(f"\n[{table.name}]")
+        for log_dir in sorted(table.rglob("_delta_log")):
+            print(f"  {log_dir.relative_to(table)}/")
+            for path in sorted(log_dir.iterdir()):
+                print(f"    - {path.name}")
 
 
 if __name__ == "__main__":

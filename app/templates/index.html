@@ -11,6 +11,7 @@
       --green-bg: #e7f6ec; --green-fg: #1a7f37;
       --red-bg: #fdeaea; --red-fg: #b42318;
       --amber-bg: #fef3e2; --amber-fg: #b25e09;
+      --purple-bg: #f3e8fd; --purple-fg: #7e22ce;
     }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
@@ -45,6 +46,7 @@
     .badge-recoverable { background: var(--green-bg); color: var(--green-fg); }
     .badge-missing_commit { background: var(--red-bg); color: var(--red-fg); }
     .badge-missing_files { background: var(--amber-bg); color: var(--amber-fg); }
+    .badge-conflict { background: var(--purple-bg); color: var(--purple-fg); }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left;
              vertical-align: top; }
@@ -55,6 +57,9 @@
     .filelist li.missing { color: var(--red-fg); font-weight: 700; }
     .filelist li.ok { color: #374151; }
     .miss-commits { color: var(--red-fg); font-weight: 700; font-family: ui-monospace, monospace; }
+    .conflict-commits { color: var(--purple-fg); font-weight: 700; font-family: ui-monospace, monospace; }
+    .conflict-item { font-size: 12px; color: var(--purple-fg); margin-top: 4px; }
+    .conflict-item strong { font-family: ui-monospace, monospace; }
     .kv { font-size: 13px; color: var(--muted); }
     .kv code { background: #f1f4f9; padding: 1px 6px; border-radius: 4px; color: #334155; }
     .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
@@ -69,8 +74,9 @@
 <body>
   <header>
     <h1>Delta Lake 版本可恢复性分析</h1>
-    <p>上传 _delta_log 留存的 JSON 提交 / 经典单文件 Parquet 检查点与现存数据文件清单，
-       逐版重放并核对快照引用，找出文件齐全、可完整重建的版本。仅支持无删除向量的表。</p>
+    <p>上传两批备份留存的 _delta_log JSON 提交 / 经典单文件 Parquet 检查点与现存数据文件清单，
+       逐版重放并核对快照引用，找出文件齐全、可完整重建的版本。同名日志所有副本字节一致才去重，
+       内容有出入即整组弃用并列出文件名，结论与上传顺序无关。仅支持无删除向量的表。</p>
   </header>
 
   <main>
@@ -91,11 +97,15 @@
                    value="{{ form.to_version if form else 4 }}" required>
           </div>
         </div>
-        <label for="log_files">_delta_log 留存文件（可多选：*.json 提交、*.checkpoint.parquet 检查点）</label>
+        <label for="log_files">_delta_log 留存文件 · 批次 A（可多选：*.json 提交、*.checkpoint.parquet 检查点）</label>
         <input type="file" id="log_files" name="log_files" multiple
                accept=".json,.parquet" required>
+        <label for="log_files_b">_delta_log 留存文件 · 批次 B（可选：另一批备份一并提交核对）</label>
+        <input type="file" id="log_files_b" name="log_files_b" multiple
+               accept=".json,.parquet">
         <div class="hint">文件名须保持 20 位补零版本号，如 00000000000000000003.json、
-          00000000000000000002.checkpoint.parquet</div>
+          00000000000000000002.checkpoint.parquet。两批中同名文件：所有副本字节一致才自动去重；
+          内容有出入则整组副本都不用，并在报告中列出文件名。</div>
         <label for="manifest_files">现存数据文件表内相对路径清单（可多选，每行一个路径）</label>
         <input type="file" id="manifest_files" name="manifest_files" multiple accept=".txt,.csv">
         <div class="hint">例如 data/part-00000-aaa.parquet；缺失清单时所有引用文件都会被判为缺失</div>
@@ -113,7 +123,8 @@
         </button>
         {% endfor %}
       </div>
-      <div class="hint">样例由 Docker 镜像内 samples/ 目录提供，点击即调用后端 API 完成分析。</div>
+      <div class="hint">样例由 Docker 镜像内 samples/ 目录提供（事故样例含 batch_a / batch_b
+        两批日志，也可在上方表单中分别选择两批目录手动上传），点击即调用后端 API 完成分析。</div>
     </section>
 
     <section id="report-root"></section>
@@ -126,8 +137,10 @@
     const STATUS_TEXT = {
       recoverable: "可重建 · 文件齐全",
       missing_commit: "缺失提交，重放中断",
-      missing_files: "重放完整但缺数据文件"
+      missing_files: "重放完整但缺数据文件",
+      conflict: "同名日志冲突，无法重建"
     };
+    const CONFLICT_KIND_TEXT = {commit: "JSON 提交", checkpoint: "检查点"};
 
     function esc(s) {
       return String(s).replace(/[&<>"']/g, c =>
@@ -143,26 +156,46 @@
     function renderReport(r) {
       const s = r.summary;
       const rows = r.versions.map(v => {
-        const files = v.referenced_files.map(p => {
-          const miss = v.missing_files.includes(p);
-          return '<li class="' + (miss ? 'missing' : 'ok') + '">' +
-            (miss ? '✗ 缺失 ' : '✓ ') + esc(p) + '</li>';
-        }).join('');
+        let commitCell = '';
+        if (v.conflict_commits && v.conflict_commits.length) {
+          commitCell += '<div class="conflict-commits">冲突弃用：' +
+            v.conflict_commits.map(c => 'v' + c).join(', ') + '</div>';
+        }
+        if (v.missing_commits && v.missing_commits.length) {
+          commitCell += '<div class="miss-commits">未上传：' +
+            v.missing_commits.map(c => 'v' + c).join(', ') + '</div>';
+        }
+        if (!commitCell) commitCell = '<span class="kv">连续无断档</span>';
+
+        let fileCell;
+        if (v.file_check_hidden) {
+          fileCell = '<div class="kv">同名日志冲突，本版不核对文件</div>';
+        } else {
+          const files = v.referenced_files.map(p => {
+            const miss = v.missing_files.includes(p);
+            return '<li class="' + (miss ? 'missing' : 'ok') + '">' +
+              (miss ? '✗ 缺失 ' : '✓ ') + esc(p) + '</li>';
+          }).join('');
+          fileCell = '<div class="kv">快照引用 ' + v.referenced_file_count + ' 个文件，' +
+            '缺失 ' + v.missing_files.length + ' 个</div>' +
+            (files ? '<details><summary>查看文件核对明细</summary><ul class="filelist">' +
+              files + '</ul></details>' : '');
+        }
         return '<tr>' +
           '<td class="ver">v' + v.version + '</td>' +
           '<td><span class="badge badge-' + v.status + '">' + STATUS_TEXT[v.status] + '</span></td>' +
           '<td class="kv">' + (v.base ? '起点 <code>' + esc(v.base) + '</code>' : '无可用起点') +
             (v.note ? '<br>' + esc(v.note) : '') + '</td>' +
-          '<td>' + (v.missing_commits.length
-              ? '<span class="miss-commits">缺提交号：' +
-                v.missing_commits.map(c => 'v' + c).join(', ') + '</span>'
-              : '<span class="kv">连续无断档</span>') + '</td>' +
-          '<td><div class="kv">快照引用 ' + v.referenced_file_count + ' 个文件，' +
-            '缺失 ' + v.missing_files.length + ' 个</div>' +
-            (files ? '<details><summary>查看文件核对明细</summary><ul class="filelist">' +
-              files + '</ul></details>' : '') + '</td>' +
+          '<td>' + commitCell + '</td>' +
+          '<td>' + fileCell + '</td>' +
           '</tr>';
       }).join('');
+
+      const conflicts = (r.conflict_files || []).map(c =>
+        '<div class="conflict-item">⚠ <strong>' + esc(c.name) + '</strong>（' +
+        esc(CONFLICT_KIND_TEXT[c.kind] || c.kind) + ' v' + c.version + '，' + c.copies +
+        ' 份副本内容不一致）：整组副本均未采用</div>'
+      ).join('');
 
       const ignored = (r.ignored_files || []).map(i =>
         '<div class="ignored">• <strong>' + esc(i.name) + '</strong>：' + esc(i.reason) + '</div>'
@@ -173,6 +206,8 @@
         '<div class="summary">' +
           '<div class="stat"><div class="num" style="color:var(--green-fg)">' + s.recoverable +
             '</div><div class="lbl">可重建且文件齐全</div></div>' +
+          '<div class="stat"><div class="num" style="color:var(--purple-fg)">' + (s.conflict || 0) +
+            '</div><div class="lbl">同名冲突无法重建</div></div>' +
           '<div class="stat"><div class="num" style="color:var(--red-fg)">' + s.missing_commit +
             '</div><div class="lbl">缺失提交号 / 重放中断</div></div>' +
           '<div class="stat"><div class="num" style="color:var(--amber-fg)">' + s.missing_files +
@@ -184,14 +219,17 @@
           chips(r.available_checkpoints.map(v => 'v' + v)) + '</div>' +
         '<div class="kv" style="margin-top:8px">现存清单文件：' + esc((r.manifests || []).join(', ') || '（未上传）') +
           '；清单内现存数据文件 <strong>' + r.existing_file_count + '</strong> 个</div>' +
+        (conflicts
+          ? '<div style="margin-top:8px"><div class="kv"><strong>同名文件内容不一致，整组弃用：</strong></div>' +
+            conflicts + '</div>' : '') +
         (r.duplicate_files && r.duplicate_files.length
-          ? '<div class="ignored" style="margin-top:8px">重复上传已去重：' +
+          ? '<div class="ignored" style="margin-top:8px">同名副本字节一致，已去重：' +
             r.duplicate_files.map(esc).join(', ') + '</div>' : '') +
         (ignored ? '<div style="margin-top:8px">' + ignored + '</div>' : '') +
       '</section>' +
       '<section class="card"><h2>逐版重放与文件核对</h2>' +
         '<table><thead><tr><th>版本</th><th>结论</th><th>重放起点</th>' +
-        '<th>缺失提交</th><th>快照引用文件核对</th></tr></thead><tbody>' +
+        '<th>冲突 / 缺失提交</th><th>快照引用文件核对</th></tr></thead><tbody>' +
         rows + '</tbody></table></section>';
     }
 

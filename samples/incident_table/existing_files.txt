@@ -5,3 +5,4 @@ data/part-00001-incident.parquet
 ./data/part-00002-incident.parquet
 data/part-00003-incident.parquet
 ./data/part-00005-incident.parquet
+data/part-00006-incident.parquet

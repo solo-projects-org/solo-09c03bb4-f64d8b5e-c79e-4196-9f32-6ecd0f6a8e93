@@ -16,6 +16,7 @@ import pytest
 from app.analyzer import (
     AnalyzerError,
     InputFile,
+    STATUS_CONFLICT,
     STATUS_MISSING_COMMIT,
     STATUS_MISSING_FILES,
     STATUS_RECOVERABLE,
@@ -300,7 +301,131 @@ def test_duplicate_upload_deduped():
     report = analyze([c, InputFile(filename=c.filename, data=c.data)],
                      [manifest([f(0)])], 0, 0)
     assert c.filename in report["duplicate_files"]
+    assert report["conflict_files"] == []
     assert report["versions"][0]["status"] == STATUS_RECOVERABLE
+
+
+# ---------- 两批备份：同名副本去重与冲突 ----------
+
+def clashing_commit(version: int, path: str = "data/clash.parquet") -> InputFile:
+    """构造与 commit_file 同版本但内容不同的提交文件。"""
+    payload = json.dumps({"add": {"path": path, "size": 999, "dataChange": True}})
+    return InputFile(filename=f"{version:020d}.json", data=payload.encode("utf-8"))
+
+
+def test_identical_copies_deduped_regardless_of_order():
+    c0 = commit_file(0, [add(f(0))])
+    c1 = commit_file(1, [add(f(1))])
+    dup1 = InputFile(filename=c1.filename, data=c1.data)
+    for logs in ([c0, c1, dup1], [c0, dup1, c1]):
+        report = analyze(logs, [manifest([f(0), f(1)])], 1, 1)
+        assert report["versions"][0]["status"] == STATUS_RECOVERABLE
+        assert report["duplicate_files"] == [c1.filename]
+        assert report["conflict_files"] == []
+        assert report["available_commits"] == [0, 1]
+
+
+def test_conflicting_commit_excluded_and_blocks_replay():
+    logs = [commit_file(0, [add(f(0))]), commit_file(1, [add(f(1))]),
+            clashing_commit(1)]
+    report = analyze(logs, [manifest([f(0), f(1)])], 0, 1)
+    # 冲突文件列出文件名与副本数，整组不参与重放
+    assert report["conflict_files"] == [
+        {"name": f"{1:020d}.json", "kind": "commit", "version": 1, "copies": 2}]
+    assert report["available_commits"] == [0]
+    v0, v1 = report["versions"]
+    assert v0["status"] == STATUS_RECOVERABLE
+    assert v1["status"] == STATUS_CONFLICT
+    assert v1["conflict_commits"] == [1]
+    assert v1["missing_commits"] == []
+    # 因冲突不能重建的版本不展示文件核对结果
+    assert v1["file_check_hidden"] is True
+    assert v1["referenced_files"] == []
+    assert v1["missing_files"] == []
+    assert report["summary"][STATUS_CONFLICT] == 1
+
+
+def test_conflict_detection_independent_of_upload_order():
+    c0 = commit_file(0, [add(f(0))])
+    c1 = commit_file(1, [add(f(1))])
+    clash = clashing_commit(1)
+    first = analyze([c0, c1, clash], [manifest([f(0), f(1)])], 1, 1)
+    swapped = analyze([c0, clash, c1], [manifest([f(0), f(1)])], 1, 1)
+    for report in (first, swapped):
+        assert report["versions"][0]["status"] == STATUS_CONFLICT
+        assert report["versions"][0]["conflict_commits"] == [1]
+
+
+def test_three_copies_one_diverges_is_conflict():
+    c1 = commit_file(1, [add(f(1))])
+    same = InputFile(filename=c1.filename, data=c1.data)
+    diff = InputFile(filename=c1.filename, data=c1.data + b"\n")
+    logs = [commit_file(0, [add(f(0))]), c1, same, diff]
+    report = analyze(logs, [manifest([f(0), f(1)])], 1, 1)
+    assert report["versions"][0]["status"] == STATUS_CONFLICT
+    assert report["conflict_files"][0]["copies"] == 3
+
+
+def test_conflicting_checkpoint_excluded_falls_back_to_commit_zero():
+    ck_a = checkpoint_file(1, [f(0)])
+    ck_b = InputFile(filename=ck_a.filename,
+                     data=checkpoint_file(1, [f(0), f(9)]).data)
+    logs = [commit_file(0, [add(f(0))]), commit_file(1, [add(f(1))]), ck_a, ck_b]
+    report = analyze(logs, [manifest([f(0), f(1)])], 1, 1)
+    assert report["available_checkpoints"] == []
+    assert [c["name"] for c in report["conflict_files"]] == [ck_a.filename]
+    assert report["conflict_files"][0]["kind"] == "checkpoint"
+    v1 = report["versions"][0]
+    # 无冲突检查点不可用 -> 回退到 0 版提交起算，结论不受影响
+    assert v1["base"] == "commit-0"
+    assert v1["status"] == STATUS_RECOVERABLE
+    assert v1["conflict_commits"] == []
+
+
+def test_conflicted_commit_covered_by_later_checkpoint_does_not_block():
+    # v3 提交冲突弃用，但 v4 检查点无冲突且已包含 v3 的改动
+    logs = [checkpoint_file(4, [f(0), f(3), f(4)]),
+            commit_file(3, [add(f(3))]), clashing_commit(3)]
+    report = analyze(logs, [manifest([f(0), f(3), f(4)])], 4, 4)
+    v4 = report["versions"][0]
+    assert v4["base"] == "checkpoint-4"
+    assert v4["status"] == STATUS_RECOVERABLE
+    assert v4["conflict_commits"] == []
+    assert v4["file_check_hidden"] is False
+
+
+def test_missing_and_conflicting_commits_listed_separately():
+    logs = [commit_file(0, [add(f(0))]),
+            commit_file(1, [add(f(1))]), clashing_commit(1)]
+    # v2 提交两批都未上传；v1 提交冲突弃用
+    report = analyze(logs, [manifest([f(0), f(1)])], 2, 2)
+    v2 = report["versions"][0]
+    assert v2["status"] == STATUS_CONFLICT
+    assert v2["conflict_commits"] == [1]
+    assert v2["missing_commits"] == [2]
+    assert v2["file_check_hidden"] is True
+
+
+def test_conflicted_commit_zero_means_no_base():
+    logs = [commit_file(0, [add(f(0))]), clashing_commit(0, "data/other.parquet"),
+            commit_file(1, [add(f(1))])]
+    report = analyze(logs, [manifest([f(0), f(1)])], 1, 1)
+    v1 = report["versions"][0]
+    assert v1["base"] is None
+    assert v1["status"] == STATUS_CONFLICT
+    assert v1["conflict_commits"] == [0]
+    assert v1["missing_commits"] == []
+    assert v1["file_check_hidden"] is True
+
+
+def test_conflicting_corrupt_copy_never_parsed():
+    # 冲突副本在解析前整组弃用：其中一份是坏字节也不影响结论
+    c1 = commit_file(1, [add(f(1))])
+    garbage = InputFile(filename=c1.filename, data=b"\x00\xff not json")
+    report = analyze([commit_file(0, [add(f(0))]), c1, garbage],
+                     [manifest([f(0), f(1)])], 1, 1)
+    assert report["versions"][0]["status"] == STATUS_CONFLICT
+    assert report["versions"][0]["conflict_commits"] == [1]
 
 
 def test_no_manifest_means_every_referenced_file_is_missing():
